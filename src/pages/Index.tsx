@@ -335,7 +335,7 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
             <thead>
               <tr className="border-b border-border bg-secondary/30">
                 <th className="text-left px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap sticky left-0 bg-card z-10 border-r border-border min-w-[110px]">
-                  Шифр
+                  Заказчик
                 </th>
                 <th className="text-left px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap sticky left-[110px] bg-card z-10 border-r border-border min-w-[220px]">
                   Наименование

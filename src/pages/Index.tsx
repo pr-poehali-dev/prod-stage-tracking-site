@@ -28,9 +28,14 @@ interface ExcelRow {
   statuses: Record<string, CellStatus>; // key -> статус
 }
 
+interface GroupedName {
+  name: string;
+  rows: ExcelRow[];
+}
+
 interface GroupedClient {
   client: string;
-  rows: ExcelRow[];
+  names: GroupedName[];
 }
 
 interface ExcelData {
@@ -172,13 +177,19 @@ function parseExcel(file: File): Promise<ExcelData> {
 }
 
 function groupByClient(rows: ExcelRow[]): GroupedClient[] {
-  const map = new Map<string, ExcelRow[]>();
+  const clientMap = new Map<string, Map<string, ExcelRow[]>>();
   for (const row of rows) {
-    const key = row.client || "—";
-    if (!map.has(key)) map.set(key, []);
-    map.get(key)!.push(row);
+    const clientKey = row.client || "—";
+    const nameKey = row.name || "—";
+    if (!clientMap.has(clientKey)) clientMap.set(clientKey, new Map());
+    const nameMap = clientMap.get(clientKey)!;
+    if (!nameMap.has(nameKey)) nameMap.set(nameKey, []);
+    nameMap.get(nameKey)!.push(row);
   }
-  return Array.from(map.entries()).map(([client, rows]) => ({ client, rows }));
+  return Array.from(clientMap.entries()).map(([client, nameMap]) => ({
+    client,
+    names: Array.from(nameMap.entries()).map(([name, rows]) => ({ name, rows })),
+  }));
 }
 
 // ─── Status Dropdown ─────────────────────────────────────────────────────────
@@ -304,6 +315,7 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
   const [filterStatus, setFilterStatus] = useState<CellStatus | "all">("all");
   const [filterCat, setFilterCat] = useState<string>("all");
   const [collapsedClients, setCollapsedClients] = useState<Set<string>>(new Set());
+  const [collapsedNames, setCollapsedNames] = useState<Set<string>>(new Set());
 
   // Видимые колонки оборудования (с учётом фильтра категории)
   const visibleCols = useMemo(() =>
@@ -350,8 +362,22 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
     });
   }
 
+  function toggleName(key: string) {
+    setCollapsedNames(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }
+
   function toggleAll(collapse: boolean) {
-    setCollapsedClients(collapse ? new Set(groups.map(g => g.client)) : new Set());
+    if (collapse) {
+      setCollapsedClients(new Set(groups.map(g => g.client)));
+      setCollapsedNames(new Set(groups.flatMap(g => g.names.map(n => `${g.client}__${n.name}`))));
+    } else {
+      setCollapsedClients(new Set());
+      setCollapsedNames(new Set());
+    }
   }
 
   // Группировка заголовков по категориям для colspan
@@ -505,23 +531,24 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
                   </td>
                 </tr>
               ) : groups.map(group => {
-                const isCollapsed = collapsedClients.has(group.client);
-                const done = group.rows.flatMap(r => Object.values(r.statuses)).filter(s => s === "completed").length;
-                const total = group.rows.flatMap(r => Object.values(r.statuses)).filter(s => s !== "empty").length;
+                const isClientCollapsed = collapsedClients.has(group.client);
+                const allRows = group.names.flatMap(n => n.rows);
+                const done = allRows.flatMap(r => Object.values(r.statuses)).filter(s => s === "completed").length;
+                const total = allRows.flatMap(r => Object.values(r.statuses)).filter(s => s !== "empty").length;
                 const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
                 return (
                   <>
-                    {/* Group header */}
+                    {/* Заказчик */}
                     <tr key={`g-${group.client}`}
                       className="border-b border-border bg-secondary/50 hover:bg-secondary/70 cursor-pointer transition-colors"
                       onClick={() => toggleClient(group.client)}>
                       <td className="px-3 py-2 sticky left-0 bg-secondary/50 border-r border-border z-10" colSpan={2}>
                         <div className="flex items-center gap-2">
-                          <Icon name={isCollapsed ? "ChevronRight" : "ChevronDown"} size={13} className="text-muted-foreground flex-shrink-0" />
+                          <Icon name={isClientCollapsed ? "ChevronRight" : "ChevronDown"} size={13} className="text-muted-foreground flex-shrink-0" />
                           <Icon name="Building2" size={12} className="text-primary flex-shrink-0" />
                           <span className="font-semibold text-sm text-foreground">{group.client}</span>
-                          <span className="text-muted-foreground font-mono-data">({group.rows.length})</span>
+                          <span className="text-muted-foreground font-mono-data">({group.names.length} изд.)</span>
                           {total > 0 && (
                             <div className="flex items-center gap-2 ml-3">
                               <div className="w-16 h-1 bg-border rounded-full overflow-hidden">
@@ -537,48 +564,84 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
                       ))}
                     </tr>
 
-                    {/* Data rows */}
-                    {!isCollapsed && group.rows.map((row, ri) => (
-                      <tr key={row.id}
-                        className={`border-b border-border/40 hover:bg-secondary/20 transition-colors ${ri % 2 === 0 ? "" : "bg-secondary/5"}`}>
-                        {/* Заказчик — пустой, уже показан в группе */}
-                        <td className="px-3 py-1.5 sticky left-0 border-r border-border z-10 text-muted-foreground/40 font-mono-data"
-                          style={{ background: ri % 2 === 0 ? "hsl(220 16% 9%)" : "hsl(220 14% 11%)" }}>
-                          {/* пусто */}
-                        </td>
-                        <td className="px-3 py-1.5 sticky left-[160px] border-r border-border z-10 font-medium"
-                          style={{ background: ri % 2 === 0 ? "hsl(220 16% 9%)" : "hsl(220 14% 11%)" }}>
-                          <div className="flex items-center gap-1.5">
-                            <span className="w-1 h-1 rounded-full bg-border/60 flex-shrink-0" />
-                            {row.name}
-                          </div>
-                        </td>
-                        <td className="px-3 py-1.5 border-r border-border font-mono-data text-primary/80 whitespace-nowrap">{row.cipher}</td>
-                        <td className="px-2 py-1.5 border-r border-border text-center text-muted-foreground">{row.position}</td>
-                        <td className="px-2 py-1.5 border-r border-border text-center font-mono-data">{row.qty}</td>
-                        <td className="px-2 py-1.5 border-r border-border text-center font-mono-data text-muted-foreground whitespace-nowrap">{row.dateFrom || "—"}</td>
-                        <td className="px-2 py-1.5 border-r border-border text-center font-mono-data text-muted-foreground whitespace-nowrap">{row.dateTo || "—"}</td>
-                        {visibleCols.map((col, ci) => {
-                          const prev = visibleCols[ci - 1];
-                          const showBorder = !prev || prev.category !== col.category;
-                          const date = row.equipment[col.key];
-                          const status = row.statuses[col.key];
-                          return (
-                            <td key={col.key}
-                              className={`px-2 py-1.5 border-r border-border/30 ${showBorder ? "border-l border-border/50" : ""}`}>
-                              {date ? (
-                                <div className="space-y-0.5">
-                                  <div className={`font-mono-data ${STATUS_CONFIG[status].cls} whitespace-nowrap`}>{date}</div>
-                                  <StatusDropdown value={status} onChange={s => updateStatus(row.id, col.key, s)} />
-                                </div>
-                              ) : (
-                                <span className="text-muted-foreground/20">—</span>
-                              )}
+                    {/* Наименования */}
+                    {!isClientCollapsed && group.names.map(nameGroup => {
+                      const nameKey = `${group.client}__${nameGroup.name}`;
+                      const isNameCollapsed = collapsedNames.has(nameKey);
+                      const nameDone = nameGroup.rows.flatMap(r => Object.values(r.statuses)).filter(s => s === "completed").length;
+                      const nameTotal = nameGroup.rows.flatMap(r => Object.values(r.statuses)).filter(s => s !== "empty").length;
+                      const namePct = nameTotal > 0 ? Math.round((nameDone / nameTotal) * 100) : 0;
+
+                      return (
+                        <>
+                          {/* Наименование — строка-подзаголовок */}
+                          <tr key={`n-${nameKey}`}
+                            className="border-b border-border/60 bg-card hover:bg-secondary/30 cursor-pointer transition-colors"
+                            onClick={() => toggleName(nameKey)}>
+                            <td className="px-3 py-1.5 sticky left-0 border-r border-border z-10 bg-card" />
+                            <td className="px-3 py-1.5 sticky left-[160px] border-r border-border z-10 bg-card">
+                              <div className="flex items-center gap-2">
+                                <Icon name={isNameCollapsed ? "ChevronRight" : "ChevronDown"} size={12} className="text-muted-foreground/60 flex-shrink-0" />
+                                <Icon name="Layers" size={11} className="text-muted-foreground flex-shrink-0" />
+                                <span className="font-medium text-foreground">{nameGroup.name}</span>
+                                <span className="text-muted-foreground/60 font-mono-data text-xs">({nameGroup.rows.length} поз.)</span>
+                                {nameTotal > 0 && (
+                                  <div className="flex items-center gap-1.5 ml-2">
+                                    <div className="w-12 h-1 bg-border rounded-full overflow-hidden">
+                                      <div className="h-full bg-blue-400/60 rounded-full" style={{ width: `${namePct}%` }} />
+                                    </div>
+                                    <span className="font-mono-data text-muted-foreground/60 text-xs">{namePct}%</span>
+                                  </div>
+                                )}
+                              </div>
                             </td>
-                          );
-                        })}
-                      </tr>
-                    ))}
+                            {Array.from({ length: 5 + visibleCols.length }).map((_, i) => (
+                              <td key={i} className="border-r border-border/20" />
+                            ))}
+                          </tr>
+
+                          {/* Позиции */}
+                          {!isNameCollapsed && nameGroup.rows.map((row, ri) => (
+                            <tr key={row.id}
+                              className={`border-b border-border/30 hover:bg-secondary/20 transition-colors ${ri % 2 === 0 ? "" : "bg-secondary/5"}`}>
+                              <td className="px-3 py-1.5 sticky left-0 border-r border-border z-10"
+                                style={{ background: ri % 2 === 0 ? "hsl(220 16% 9%)" : "hsl(220 14% 11%)" }} />
+                              <td className="px-3 py-1.5 sticky left-[160px] border-r border-border z-10 text-muted-foreground/50 text-xs"
+                                style={{ background: ri % 2 === 0 ? "hsl(220 16% 9%)" : "hsl(220 14% 11%)" }}>
+                                <div className="pl-7 flex items-center gap-1.5">
+                                  <span className="w-1 h-1 rounded-full bg-border/40 flex-shrink-0" />
+                                  поз. {row.position || (ri + 1)}
+                                </div>
+                              </td>
+                              <td className="px-3 py-1.5 border-r border-border font-mono-data text-primary/70 whitespace-nowrap text-xs">{row.cipher}</td>
+                              <td className="px-2 py-1.5 border-r border-border text-center text-muted-foreground">{row.position}</td>
+                              <td className="px-2 py-1.5 border-r border-border text-center font-mono-data">{row.qty}</td>
+                              <td className="px-2 py-1.5 border-r border-border text-center font-mono-data text-muted-foreground whitespace-nowrap">{row.dateFrom || "—"}</td>
+                              <td className="px-2 py-1.5 border-r border-border text-center font-mono-data text-muted-foreground whitespace-nowrap">{row.dateTo || "—"}</td>
+                              {visibleCols.map((col, ci) => {
+                                const prev = visibleCols[ci - 1];
+                                const showBorder = !prev || prev.category !== col.category;
+                                const date = row.equipment[col.key];
+                                const status = row.statuses[col.key];
+                                return (
+                                  <td key={col.key}
+                                    className={`px-2 py-1.5 border-r border-border/30 ${showBorder ? "border-l border-border/50" : ""}`}>
+                                    {date ? (
+                                      <div className="space-y-0.5">
+                                        <div className={`font-mono-data ${STATUS_CONFIG[status].cls} whitespace-nowrap`}>{date}</div>
+                                        <StatusDropdown value={status} onChange={s => updateStatus(row.id, col.key, s)} />
+                                      </div>
+                                    ) : (
+                                      <span className="text-muted-foreground/20">—</span>
+                                    )}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                        </>
+                      );
+                    })}
                   </>
                 );
               })}
@@ -590,6 +653,8 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
         <div className="px-4 py-2 border-t border-border flex items-center justify-between text-xs text-muted-foreground">
           <span>
             Заказчиков: <span className="font-mono-data text-foreground">{groups.length}</span>
+            &nbsp;·&nbsp;
+            Изделий: <span className="font-mono-data text-foreground">{groups.reduce((s, g) => s + g.names.length, 0)}</span>
             &nbsp;·&nbsp;
             Позиций: <span className="font-mono-data text-foreground">{filteredRows.length}</span>
             {filteredRows.length !== data.rows.length && <span> из {data.rows.length}</span>}

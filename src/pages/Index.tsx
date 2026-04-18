@@ -6,26 +6,44 @@ import Icon from "@/components/ui/icon";
 
 type CellStatus = "planned" | "in-progress" | "completed" | "delayed" | "empty";
 
+// Один станок с иерархией заголовков
+interface EquipCol {
+  key: string;        // уникальный ключ колонки
+  category: string;   // строка 1 (напр. "Токарная")
+  subcategory: string;// строка 2 (напр. "DK7765")
+  machine: string;    // строка 3 (напр. "WRU SERVO 130") — может совпадать с subcategory
+  colIndex: number;   // индекс в исходном массиве
+}
+
 interface ExcelRow {
   id: string;
-  cipher: string;   // заказчик (может быть пустым — тогда берём из предыдущей строки)
-  name: string;
-  equipment: Record<string, string>;
-  statuses: Record<string, CellStatus>;
+  client: string;     // Заказчик (col 0)
+  name: string;       // Наименование (col 1)
+  cipher: string;     // Шифр (col 2)
+  position: string;   // Позиция (col 3)
+  qty: string;        // Кол-во (col 4)
+  dateFrom: string;   // Дата план 1 (col 5)
+  dateTo: string;     // Дата план 2 (col 6)
+  equipment: Record<string, string>;    // key -> дата
+  statuses: Record<string, CellStatus>; // key -> статус
 }
 
 interface GroupedClient {
   client: string;
   rows: ExcelRow[];
-  collapsed: boolean;
 }
 
 interface ExcelData {
   rows: ExcelRow[];
-  equipmentColumns: string[];
+  equipCols: EquipCol[];
+  // Уникальные категории для группировки заголовков
+  categories: string[];
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const FIXED_COLS = 7; // Заказчик, Наименование, Шифр, Позиция, Кол-во, Дата1, Дата2
+const HEADER_ROWS = 3; // три строки заголовков оборудования
 
 const STATUS_CONFIG: Record<CellStatus, { label: string; cls: string; bg: string; dot: string }> = {
   planned:       { label: "По плану",   cls: "text-blue-400",   bg: "bg-blue-400/10",   dot: "bg-blue-400" },
@@ -34,6 +52,25 @@ const STATUS_CONFIG: Record<CellStatus, { label: string; cls: string; bg: string
   delayed:       { label: "Просрочено", cls: "text-red-400",    bg: "bg-red-400/10",    dot: "bg-red-400" },
   empty:         { label: "—",          cls: "text-muted-foreground", bg: "", dot: "bg-muted" },
 };
+
+// ─── Parser ───────────────────────────────────────────────────────────────────
+
+function cellToDate(cell: unknown): string {
+  if (!cell && cell !== 0) return "";
+  if (cell instanceof Date) return cell.toLocaleDateString("ru-RU");
+  const str = String(cell).trim();
+  if (!str) return "";
+  if (/^\d{5}$/.test(str)) {
+    const d = XLSX.SSF.parse_date_code(Number(str));
+    if (d) return `${String(d.d).padStart(2, "0")}.${String(d.m).padStart(2, "0")}.${d.y}`;
+  }
+  return str;
+}
+
+function cellStr(cell: unknown): string {
+  if (cell === null || cell === undefined) return "";
+  return String(cell).trim();
+}
 
 function parseExcel(file: File): Promise<ExcelData> {
   return new Promise((resolve, reject) => {
@@ -45,60 +82,86 @@ function parseExcel(file: File): Promise<ExcelData> {
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
         const raw: unknown[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
 
-        if (raw.length < 2) { reject(new Error("Файл пустой или не содержит данных")); return; }
+        if (raw.length < HEADER_ROWS + 1) {
+          reject(new Error("Файл слишком короткий — нужно минимум 4 строки (3 заголовка + данные)"));
+          return;
+        }
 
-        const headers = (raw[0] as unknown[]).map(h => String(h ?? "").trim());
-        const equipmentColumns = headers.slice(2).filter(h => h !== "");
+        const h1 = raw[0] as unknown[]; // категории (Токарная, Фрезерная...)
+        const h2 = raw[1] as unknown[]; // подкатегории / модели
+        const h3 = raw[2] as unknown[]; // конкретные станки
 
+        // Строим список колонок оборудования
+        // Пропускаем первые FIXED_COLS колонок
+        const equipCols: EquipCol[] = [];
+        let lastCat = "";
+        let lastSub = "";
+
+        const maxCols = Math.max(h1.length, h2.length, h3.length);
+        for (let c = FIXED_COLS; c < maxCols; c++) {
+          const cat = cellStr(h1[c]) || lastCat;
+          const sub = cellStr(h2[c]) || lastSub;
+          const machine = cellStr(h3[c]) || sub;
+
+          if (!machine && !sub && !cat) continue;
+
+          if (cellStr(h1[c])) lastCat = cellStr(h1[c]);
+          if (cellStr(h2[c])) lastSub = cellStr(h2[c]);
+
+          const key = `col_${c}`;
+          equipCols.push({ key, category: cat, subcategory: sub, machine, colIndex: c });
+        }
+
+        const categories = [...new Set(equipCols.map(e => e.category).filter(Boolean))];
+
+        // Парсим строки данных
         const rows: ExcelRow[] = [];
-        let lastCipher = "";
+        let lastClient = "";
 
-        for (let i = 1; i < raw.length; i++) {
+        for (let i = HEADER_ROWS; i < raw.length; i++) {
           const row = raw[i] as unknown[];
-          const rawCipher = String(row[0] ?? "").trim();
-          const name = String(row[1] ?? "").trim();
+          const rawClient = cellStr(row[0]);
+          const name      = cellStr(row[1]);
+          const cipher    = cellStr(row[2]);
+          const position  = cellStr(row[3]);
+          const qty       = cellStr(row[4]);
+          const dateFrom  = cellToDate(row[5]);
+          const dateTo    = cellToDate(row[6]);
 
-          // Если в колонке заказчика есть значение — запоминаем его
-          if (rawCipher) lastCipher = rawCipher;
+          if (rawClient) lastClient = rawClient;
 
-          // Пропускаем полностью пустые строки
-          if (!rawCipher && !name) continue;
-
-          // Строка-заголовок группы (только заказчик, нет наименования) — не добавляем как позицию
-          if (rawCipher && !name) continue;
+          // Пропускаем пустые строки и строки-заголовки групп (только заказчик, нет остального)
+          if (!name && !cipher && !position) continue;
 
           const equipment: Record<string, string> = {};
-          equipmentColumns.forEach((col, idx) => {
-            const cell = row[idx + 2];
-            if (cell instanceof Date) {
-              equipment[col] = cell.toLocaleDateString("ru-RU");
-            } else if (cell !== "" && cell !== null && cell !== undefined) {
-              const str = String(cell).trim();
-              if (/^\d{5}$/.test(str)) {
-                const d = XLSX.SSF.parse_date_code(Number(str));
-                if (d) equipment[col] = `${String(d.d).padStart(2, "0")}.${String(d.m).padStart(2, "0")}.${d.y}`;
-                else equipment[col] = str;
-              } else {
-                equipment[col] = str;
-              }
-            }
-          });
-
           const statuses: Record<string, CellStatus> = {};
-          equipmentColumns.forEach(col => {
-            statuses[col] = equipment[col] ? "planned" : "empty";
-          });
+
+          for (const ec of equipCols) {
+            const val = cellToDate(row[ec.colIndex]);
+            equipment[ec.key] = val;
+            statuses[ec.key] = val ? "planned" : "empty";
+          }
 
           rows.push({
             id: `row-${i}`,
-            cipher: lastCipher,
+            client: lastClient,
             name,
+            cipher,
+            position,
+            qty,
+            dateFrom,
+            dateTo,
             equipment,
             statuses,
           });
         }
 
-        resolve({ rows, equipmentColumns });
+        if (rows.length === 0) {
+          reject(new Error("Не найдено строк с данными. Проверьте структуру файла."));
+          return;
+        }
+
+        resolve({ rows, equipCols, categories });
       } catch (err) {
         reject(err);
       }
@@ -108,15 +171,14 @@ function parseExcel(file: File): Promise<ExcelData> {
   });
 }
 
-// Группировка строк по заказчику
 function groupByClient(rows: ExcelRow[]): GroupedClient[] {
   const map = new Map<string, ExcelRow[]>();
   for (const row of rows) {
-    const key = row.cipher || "—";
+    const key = row.client || "—";
     if (!map.has(key)) map.set(key, []);
     map.get(key)!.push(row);
   }
-  return Array.from(map.entries()).map(([client, rows]) => ({ client, rows, collapsed: false }));
+  return Array.from(map.entries()).map(([client, rows]) => ({ client, rows }));
 }
 
 // ─── Status Dropdown ─────────────────────────────────────────────────────────
@@ -124,21 +186,18 @@ function groupByClient(rows: ExcelRow[]): GroupedClient[] {
 function StatusDropdown({ value, onChange }: { value: CellStatus; onChange: (s: CellStatus) => void }) {
   const [open, setOpen] = useState(false);
   const cfg = STATUS_CONFIG[value];
-
   return (
     <div className="relative">
-      <button
-        onClick={() => setOpen(o => !o)}
-        className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium w-full justify-between transition-colors hover:opacity-80 ${cfg.bg} ${cfg.cls}`}
-      >
-        <span className="flex items-center gap-1.5">
+      <button onClick={() => setOpen(o => !o)}
+        className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium w-full justify-between transition-colors hover:opacity-80 ${cfg.bg} ${cfg.cls}`}>
+        <span className="flex items-center gap-1">
           <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${cfg.dot}`} />
           {cfg.label}
         </span>
-        <Icon name="ChevronDown" size={10} className="flex-shrink-0 opacity-60" />
+        <Icon name="ChevronDown" size={9} className="flex-shrink-0 opacity-50" />
       </button>
       {open && (
-        <div className="absolute top-full left-0 mt-1 z-50 bg-card border border-border rounded-lg shadow-xl py-1 min-w-[140px]">
+        <div className="absolute top-full left-0 mt-1 z-50 bg-card border border-border rounded-lg shadow-xl py-1 min-w-[130px]">
           {(Object.entries(STATUS_CONFIG) as [CellStatus, typeof STATUS_CONFIG[CellStatus]][])
             .filter(([k]) => k !== "empty")
             .map(([k, v]) => (
@@ -167,7 +226,6 @@ function UploadZone({ onLoad }: { onLoad: (data: ExcelData, name: string) => voi
     setLoading(true); setError(null);
     try {
       const data = await parseExcel(file);
-      if (data.rows.length === 0) { setError("Не найдено строк с данными"); setLoading(false); return; }
       onLoad(data, file.name);
     } catch (e) {
       setError((e as Error).message ?? "Ошибка при чтении файла");
@@ -194,8 +252,7 @@ function UploadZone({ onLoad }: { onLoad: (data: ExcelData, name: string) => voi
           onDrop={e => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files[0]; if (f) handleFile(f); }}
           onClick={() => inputRef.current?.click()}
           className={`border-2 border-dashed rounded-xl p-12 text-center cursor-pointer transition-all
-            ${dragging ? "border-primary bg-primary/5" : "border-border hover:border-primary/50 hover:bg-card"}`}
-        >
+            ${dragging ? "border-primary bg-primary/5" : "border-border hover:border-primary/50 hover:bg-card"}`}>
           <input ref={inputRef} type="file" accept=".xlsx,.xls" className="hidden"
             onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
           {loading ? (
@@ -213,11 +270,18 @@ function UploadZone({ onLoad }: { onLoad: (data: ExcelData, name: string) => voi
                 <div className="font-semibold text-base mb-1">{dragging ? "Отпустите файл" : "Загрузите Excel-файл"}</div>
                 <div className="text-sm text-muted-foreground">Перетащите .xlsx или нажмите для выбора</div>
               </div>
-              <div className="bg-secondary/60 rounded-lg px-4 py-2.5 text-xs text-muted-foreground text-left space-y-1">
-                <div className="font-medium text-foreground mb-1.5">Ожидаемая структура файла:</div>
-                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">A</span> Заказчик (группировка)</div>
-                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">B</span> Наименование изделия</div>
-                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">C+</span> Оборудование → плановые даты</div>
+              <div className="bg-secondary/60 rounded-lg px-4 py-3 text-xs text-muted-foreground text-left space-y-1.5 w-full">
+                <div className="font-medium text-foreground mb-2">Ожидаемая структура:</div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                  <div><span className="font-mono-data text-primary">Строка 1:</span> Категории оборудования</div>
+                  <div><span className="font-mono-data text-primary">Кол. A:</span> Заказчик</div>
+                  <div><span className="font-mono-data text-primary">Строка 2:</span> Модели / подкатегории</div>
+                  <div><span className="font-mono-data text-primary">Кол. B:</span> Наименование</div>
+                  <div><span className="font-mono-data text-primary">Строка 3:</span> Названия станков</div>
+                  <div><span className="font-mono-data text-primary">Кол. C:</span> Шифр</div>
+                  <div><span className="font-mono-data text-primary">Данные:</span> Плановые даты</div>
+                  <div><span className="font-mono-data text-primary">Кол. D–G:</span> Позиция, Кол-во, Даты</div>
+                </div>
               </div>
             </div>
           )}
@@ -238,41 +302,44 @@ function UploadZone({ onLoad }: { onLoad: (data: ExcelData, name: string) => voi
 function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows: ExcelRow[]) => void }) {
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState<CellStatus | "all">("all");
-  const [filterEquip, setFilterEquip] = useState<string>("all");
+  const [filterCat, setFilterCat] = useState<string>("all");
   const [collapsedClients, setCollapsedClients] = useState<Set<string>>(new Set());
 
-  // Фильтрация
+  // Видимые колонки оборудования (с учётом фильтра категории)
+  const visibleCols = useMemo(() =>
+    filterCat === "all" ? data.equipCols : data.equipCols.filter(c => c.category === filterCat),
+    [data.equipCols, filterCat]
+  );
+
   const filteredRows = useMemo(() => {
     return data.rows.filter(row => {
       if (search) {
         const q = search.toLowerCase();
-        if (!row.cipher.toLowerCase().includes(q) && !row.name.toLowerCase().includes(q)) return false;
+        if (
+          !row.client.toLowerCase().includes(q) &&
+          !row.name.toLowerCase().includes(q) &&
+          !row.cipher.toLowerCase().includes(q)
+        ) return false;
       }
       if (filterStatus !== "all") {
         if (!Object.values(row.statuses).some(s => s === filterStatus)) return false;
       }
-      if (filterEquip !== "all") {
-        if (!row.equipment[filterEquip]) return false;
-      }
       return true;
     });
-  }, [data.rows, search, filterStatus, filterEquip]);
+  }, [data.rows, search, filterStatus]);
 
-  // Группировка отфильтрованных строк
   const groups = useMemo(() => groupByClient(filteredRows), [filteredRows]);
 
   const stats = useMemo(() => {
-    const all = data.rows.flatMap(r => Object.values(r.statuses));
     const counts: Record<CellStatus, number> = { planned: 0, "in-progress": 0, completed: 0, delayed: 0, empty: 0 };
-    all.forEach(s => counts[s]++);
+    data.rows.forEach(r => Object.values(r.statuses).forEach(s => counts[s]++));
     return counts;
   }, [data.rows]);
 
-  function updateStatus(rowId: string, equip: string, status: CellStatus) {
-    const updated = data.rows.map(r =>
-      r.id === rowId ? { ...r, statuses: { ...r.statuses, [equip]: status } } : r
-    );
-    onUpdate(updated);
+  function updateStatus(rowId: string, key: string, status: CellStatus) {
+    onUpdate(data.rows.map(r =>
+      r.id === rowId ? { ...r, statuses: { ...r.statuses, [key]: status } } : r
+    ));
   }
 
   function toggleClient(client: string) {
@@ -284,27 +351,35 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
   }
 
   function toggleAll(collapse: boolean) {
-    if (collapse) setCollapsedClients(new Set(groups.map(g => g.client)));
-    else setCollapsedClients(new Set());
+    setCollapsedClients(collapse ? new Set(groups.map(g => g.client)) : new Set());
   }
 
-  const activeFilters = [search !== "", filterStatus !== "all", filterEquip !== "all"].filter(Boolean).length;
-  const totalCols = 2 + data.equipmentColumns.length;
+  // Группировка заголовков по категориям для colspan
+  const categoryGroups = useMemo(() => {
+    const result: { category: string; cols: EquipCol[] }[] = [];
+    for (const col of visibleCols) {
+      const last = result[result.length - 1];
+      if (last && last.category === col.category) last.cols.push(col);
+      else result.push({ category: col.category, cols: [col] });
+    }
+    return result;
+  }, [visibleCols]);
+
+  const activeFilters = [search !== "", filterStatus !== "all", filterCat !== "all"].filter(Boolean).length;
 
   return (
     <div className="animate-slide-up">
       {/* Stats */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
         {([
-          { key: "planned",      icon: "Calendar",     label: "По плану" },
-          { key: "in-progress",  icon: "Zap",          label: "В работе" },
-          { key: "completed",    icon: "CheckCircle2",  label: "Выполнено" },
-          { key: "delayed",      icon: "AlertTriangle", label: "Просрочено" },
+          { key: "planned",      icon: "Calendar",      label: "По плану" },
+          { key: "in-progress",  icon: "Zap",           label: "В работе" },
+          { key: "completed",    icon: "CheckCircle2",   label: "Выполнено" },
+          { key: "delayed",      icon: "AlertTriangle",  label: "Просрочено" },
         ] as { key: CellStatus; icon: string; label: string }[]).map(({ key, icon, label }) => {
           const cfg = STATUS_CONFIG[key];
           return (
-            <div key={key}
-              onClick={() => setFilterStatus(f => f === key ? "all" : key)}
+            <div key={key} onClick={() => setFilterStatus(f => f === key ? "all" : key)}
               className={`rounded-lg border p-3 flex items-center gap-3 cursor-pointer transition-all
                 ${filterStatus === key ? "border-primary/40 bg-primary/5" : "border-border bg-card hover:border-border/60"}`}>
               <div className={`w-8 h-8 rounded-md flex items-center justify-center flex-shrink-0 ${cfg.bg} ${cfg.cls}`}>
@@ -326,20 +401,22 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
           <div className="relative">
             <Icon name="Search" size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
             <input value={search} onChange={e => setSearch(e.target.value)}
-              placeholder="Заказчик или наименование..."
+              placeholder="Заказчик, наименование, шифр..."
               className="w-full bg-background border border-border rounded pl-8 pr-3 py-1.5 text-sm placeholder:text-muted-foreground focus:outline-none focus:border-primary transition-colors" />
           </div>
         </div>
-        <div className="min-w-[160px]">
-          <label className="text-xs text-muted-foreground mb-1.5 block">Оборудование</label>
-          <select value={filterEquip} onChange={e => setFilterEquip(e.target.value)}
+        <div className="min-w-[180px]">
+          <label className="text-xs text-muted-foreground mb-1.5 block">Категория оборудования</label>
+          <select value={filterCat} onChange={e => setFilterCat(e.target.value)}
             className="w-full bg-background border border-border rounded px-3 py-1.5 text-sm focus:outline-none focus:border-primary transition-colors appearance-none cursor-pointer">
-            <option value="all">Все</option>
-            {data.equipmentColumns.map(col => <option key={col} value={col}>{col}</option>)}
+            <option value="all">Все ({data.equipCols.length} станков)</option>
+            {data.categories.map(cat => (
+              <option key={cat} value={cat}>{cat} ({data.equipCols.filter(c => c.category === cat).length})</option>
+            ))}
           </select>
         </div>
         {activeFilters > 0 && (
-          <button onClick={() => { setSearch(""); setFilterStatus("all"); setFilterEquip("all"); }}
+          <button onClick={() => { setSearch(""); setFilterStatus("all"); setFilterCat("all"); }}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground border border-border rounded transition-colors bg-background">
             <Icon name="X" size={12} /> Сбросить ({activeFilters})
           </button>
@@ -347,95 +424,155 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
         <div className="flex items-center gap-1 ml-auto">
           <button onClick={() => toggleAll(false)}
             className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-muted-foreground hover:text-foreground border border-border rounded transition-colors bg-background">
-            <Icon name="ChevronsDown" size={12} /> Раскрыть все
+            <Icon name="ChevronsDown" size={12} /> Раскрыть
           </button>
           <button onClick={() => toggleAll(true)}
             className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-muted-foreground hover:text-foreground border border-border rounded transition-colors bg-background">
-            <Icon name="ChevronsUp" size={12} /> Свернуть все
+            <Icon name="ChevronsUp" size={12} /> Свернуть
           </button>
         </div>
       </div>
 
       {/* Table */}
       <div className="bg-card border border-border rounded-lg overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm border-collapse">
-            <thead>
-              <tr className="border-b border-border bg-secondary/30">
-                <th className="text-left px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap sticky left-0 bg-[hsl(220_14%_11%)] z-10 border-r border-border min-w-[200px]">
+        <div className="overflow-auto max-h-[calc(100vh-280px)]">
+          <table className="text-xs border-collapse" style={{ minWidth: "100%" }}>
+            <thead className="sticky top-0 z-20">
+              {/* Row 1: фиксированные + категории оборудования */}
+              <tr className="border-b border-border bg-[hsl(220_14%_9%)]">
+                <th rowSpan={3} className="text-left px-3 py-2 font-medium text-muted-foreground uppercase tracking-wider border-r border-border sticky left-0 bg-[hsl(220_14%_9%)] z-30 min-w-[160px] whitespace-nowrap">
+                  Заказчик
+                </th>
+                <th rowSpan={3} className="text-left px-3 py-2 font-medium text-muted-foreground uppercase tracking-wider border-r border-border sticky left-[160px] bg-[hsl(220_14%_9%)] z-30 min-w-[200px]">
                   Наименование
                 </th>
-                {data.equipmentColumns.map(col => (
-                  <th key={col} className="text-left px-3 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap min-w-[160px]">
-                    {col}
+                <th rowSpan={3} className="text-left px-3 py-2 font-medium text-muted-foreground uppercase tracking-wider border-r border-border min-w-[110px] whitespace-nowrap">
+                  Шифр
+                </th>
+                <th rowSpan={3} className="text-center px-2 py-2 font-medium text-muted-foreground uppercase tracking-wider border-r border-border min-w-[50px]">
+                  Поз.
+                </th>
+                <th rowSpan={3} className="text-center px-2 py-2 font-medium text-muted-foreground uppercase tracking-wider border-r border-border min-w-[50px]">
+                  Кол.
+                </th>
+                <th rowSpan={3} className="text-center px-2 py-2 font-medium text-muted-foreground uppercase tracking-wider border-r border-border min-w-[85px] whitespace-nowrap">
+                  Дата нач.
+                </th>
+                <th rowSpan={3} className="text-center px-2 py-2 font-medium text-muted-foreground uppercase tracking-wider border-r border-border min-w-[85px] whitespace-nowrap">
+                  Дата оконч.
+                </th>
+                {categoryGroups.map(cg => (
+                  <th key={cg.category} colSpan={cg.cols.length}
+                    className="text-center px-2 py-1.5 font-semibold text-foreground border-r border-b border-border bg-primary/10 whitespace-nowrap">
+                    {cg.category}
                   </th>
                 ))}
+              </tr>
+              {/* Row 2: подкатегории */}
+              <tr className="border-b border-border bg-[hsl(220_14%_9%)]">
+                {visibleCols.map((col, i) => {
+                  // Показываем подкатегорию только при смене
+                  const prev = visibleCols[i - 1];
+                  const showBorder = !prev || prev.category !== col.category;
+                  return (
+                    <th key={col.key}
+                      className={`text-center px-2 py-1 font-medium text-muted-foreground border-b border-border whitespace-nowrap min-w-[90px] ${showBorder ? "border-l border-border" : ""}`}>
+                      {col.subcategory}
+                    </th>
+                  );
+                })}
+              </tr>
+              {/* Row 3: названия станков */}
+              <tr className="border-b border-border bg-[hsl(220_14%_9%)]">
+                {visibleCols.map((col, i) => {
+                  const prev = visibleCols[i - 1];
+                  const showBorder = !prev || prev.category !== col.category;
+                  return (
+                    <th key={col.key}
+                      className={`text-center px-2 py-1.5 font-medium text-primary/80 border-b border-border whitespace-nowrap ${showBorder ? "border-l border-border" : ""}`}>
+                      {col.machine !== col.subcategory ? col.machine : ""}
+                    </th>
+                  );
+                })}
               </tr>
             </thead>
             <tbody>
               {groups.length === 0 ? (
                 <tr>
-                  <td colSpan={totalCols} className="text-center py-14 text-muted-foreground">
+                  <td colSpan={7 + visibleCols.length} className="text-center py-14 text-muted-foreground">
                     <Icon name="SearchX" size={28} className="mx-auto mb-2 opacity-30" />
-                    <div className="text-sm">Ничего не найдено</div>
+                    <div>Ничего не найдено</div>
                   </td>
                 </tr>
-              ) : groups.map((group) => {
+              ) : groups.map(group => {
                 const isCollapsed = collapsedClients.has(group.client);
-                const groupCompleted = group.rows.flatMap(r => Object.values(r.statuses)).filter(s => s === "completed").length;
-                const groupTotal = group.rows.flatMap(r => Object.values(r.statuses)).filter(s => s !== "empty").length;
-                const groupPct = groupTotal > 0 ? Math.round((groupCompleted / groupTotal) * 100) : 0;
+                const done = group.rows.flatMap(r => Object.values(r.statuses)).filter(s => s === "completed").length;
+                const total = group.rows.flatMap(r => Object.values(r.statuses)).filter(s => s !== "empty").length;
+                const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
                 return (
                   <>
-                    {/* Group header row */}
-                    <tr key={`group-${group.client}`}
-                      className="border-b border-border bg-secondary/40 hover:bg-secondary/60 cursor-pointer transition-colors"
+                    {/* Group header */}
+                    <tr key={`g-${group.client}`}
+                      className="border-b border-border bg-secondary/50 hover:bg-secondary/70 cursor-pointer transition-colors"
                       onClick={() => toggleClient(group.client)}>
-                      <td className="px-4 py-2.5 sticky left-0 bg-secondary/40 border-r border-border z-[1]">
+                      <td className="px-3 py-2 sticky left-0 bg-secondary/50 border-r border-border z-10" colSpan={2}>
                         <div className="flex items-center gap-2">
-                          <Icon name={isCollapsed ? "ChevronRight" : "ChevronDown"} size={14} className="text-muted-foreground flex-shrink-0" />
-                          <Icon name="Building2" size={13} className="text-primary flex-shrink-0" />
+                          <Icon name={isCollapsed ? "ChevronRight" : "ChevronDown"} size={13} className="text-muted-foreground flex-shrink-0" />
+                          <Icon name="Building2" size={12} className="text-primary flex-shrink-0" />
                           <span className="font-semibold text-sm text-foreground">{group.client}</span>
-                          <span className="ml-1 text-xs text-muted-foreground font-mono-data">({group.rows.length} поз.)</span>
-                          {groupTotal > 0 && (
-                            <div className="ml-auto flex items-center gap-2 pl-2">
-                              <div className="w-20 h-1 bg-border rounded-full overflow-hidden">
-                                <div className="h-full bg-green-400/70 rounded-full" style={{ width: `${groupPct}%` }} />
+                          <span className="text-muted-foreground font-mono-data">({group.rows.length})</span>
+                          {total > 0 && (
+                            <div className="flex items-center gap-2 ml-3">
+                              <div className="w-16 h-1 bg-border rounded-full overflow-hidden">
+                                <div className="h-full bg-green-400/70 rounded-full" style={{ width: `${pct}%` }} />
                               </div>
-                              <span className="text-xs font-mono-data text-muted-foreground">{groupPct}%</span>
+                              <span className="font-mono-data text-muted-foreground">{pct}%</span>
                             </div>
                           )}
                         </div>
                       </td>
-                      {data.equipmentColumns.map(col => (
-                        <td key={col} className="px-3 py-2.5" />
+                      {Array.from({ length: 5 + visibleCols.length }).map((_, i) => (
+                        <td key={i} className="border-r border-border/30" />
                       ))}
                     </tr>
 
-                    {/* Group rows */}
-                    {!isCollapsed && group.rows.map((row, i) => (
+                    {/* Data rows */}
+                    {!isCollapsed && group.rows.map((row, ri) => (
                       <tr key={row.id}
-                        className={`border-b border-border/40 hover:bg-secondary/20 transition-colors ${i % 2 === 0 ? "bg-background/30" : ""}`}>
-                        <td className="px-4 py-2.5 sticky left-0 border-r border-border z-[1]"
-                          style={{ background: i % 2 === 0 ? "hsl(220 16% 9%)" : "hsl(220 14% 11%)" }}>
-                          <div className="flex items-center gap-2 pl-5">
-                            <span className="w-1 h-1 rounded-full bg-border flex-shrink-0" />
-                            <span className="font-medium text-sm">{row.name}</span>
+                        className={`border-b border-border/40 hover:bg-secondary/20 transition-colors ${ri % 2 === 0 ? "" : "bg-secondary/5"}`}>
+                        {/* Заказчик — пустой, уже показан в группе */}
+                        <td className="px-3 py-1.5 sticky left-0 border-r border-border z-10 text-muted-foreground/40 font-mono-data"
+                          style={{ background: ri % 2 === 0 ? "hsl(220 16% 9%)" : "hsl(220 14% 11%)" }}>
+                          {/* пусто */}
+                        </td>
+                        <td className="px-3 py-1.5 sticky left-[160px] border-r border-border z-10 font-medium"
+                          style={{ background: ri % 2 === 0 ? "hsl(220 16% 9%)" : "hsl(220 14% 11%)" }}>
+                          <div className="flex items-center gap-1.5">
+                            <span className="w-1 h-1 rounded-full bg-border/60 flex-shrink-0" />
+                            {row.name}
                           </div>
                         </td>
-                        {data.equipmentColumns.map(col => {
-                          const date = row.equipment[col];
-                          const status = row.statuses[col];
+                        <td className="px-3 py-1.5 border-r border-border font-mono-data text-primary/80 whitespace-nowrap">{row.cipher}</td>
+                        <td className="px-2 py-1.5 border-r border-border text-center text-muted-foreground">{row.position}</td>
+                        <td className="px-2 py-1.5 border-r border-border text-center font-mono-data">{row.qty}</td>
+                        <td className="px-2 py-1.5 border-r border-border text-center font-mono-data text-muted-foreground whitespace-nowrap">{row.dateFrom || "—"}</td>
+                        <td className="px-2 py-1.5 border-r border-border text-center font-mono-data text-muted-foreground whitespace-nowrap">{row.dateTo || "—"}</td>
+                        {visibleCols.map((col, ci) => {
+                          const prev = visibleCols[ci - 1];
+                          const showBorder = !prev || prev.category !== col.category;
+                          const date = row.equipment[col.key];
+                          const status = row.statuses[col.key];
                           return (
-                            <td key={col} className="px-3 py-2">
+                            <td key={col.key}
+                              className={`px-2 py-1.5 border-r border-border/30 ${showBorder ? "border-l border-border/50" : ""}`}>
                               {date ? (
-                                <div className="space-y-1">
-                                  <div className={`font-mono-data text-xs ${STATUS_CONFIG[status].cls}`}>{date}</div>
-                                  <StatusDropdown value={status} onChange={s => updateStatus(row.id, col, s)} />
+                                <div className="space-y-0.5">
+                                  <div className={`font-mono-data ${STATUS_CONFIG[status].cls} whitespace-nowrap`}>{date}</div>
+                                  <StatusDropdown value={status} onChange={s => updateStatus(row.id, col.key, s)} />
                                 </div>
                               ) : (
-                                <span className="text-muted-foreground/25 text-xs">—</span>
+                                <span className="text-muted-foreground/20">—</span>
                               )}
                             </td>
                           );
@@ -450,12 +587,15 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-2.5 border-t border-border flex items-center justify-between text-xs text-muted-foreground">
+        <div className="px-4 py-2 border-t border-border flex items-center justify-between text-xs text-muted-foreground">
           <span>
             Заказчиков: <span className="font-mono-data text-foreground">{groups.length}</span>
             &nbsp;·&nbsp;
             Позиций: <span className="font-mono-data text-foreground">{filteredRows.length}</span>
             {filteredRows.length !== data.rows.length && <span> из {data.rows.length}</span>}
+            &nbsp;·&nbsp;
+            Станков: <span className="font-mono-data text-foreground">{visibleCols.length}</span>
+            {visibleCols.length !== data.equipCols.length && <span> из {data.equipCols.length}</span>}
           </span>
           <span className="flex items-center gap-1.5">
             <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
@@ -485,7 +625,7 @@ export default function Index() {
 
   return (
     <div className="min-h-screen bg-background">
-      <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-20">
+      <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-30">
         <div className="max-w-screen-2xl mx-auto px-4 sm:px-6">
           <div className="flex items-center justify-between h-14">
             <div className="flex items-center gap-3">
@@ -498,7 +638,7 @@ export default function Index() {
               </div>
             </div>
             {excelData && (
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2">
                 {fileName && (
                   <div className="hidden sm:flex items-center gap-1.5 text-xs text-muted-foreground bg-secondary/50 px-2.5 py-1.5 rounded border border-border">
                     <Icon name="FileSpreadsheet" size={12} className="text-green-400" />

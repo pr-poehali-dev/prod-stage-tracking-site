@@ -314,6 +314,7 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState<CellStatus | "all">("all");
   const [filterCat, setFilterCat] = useState<string>("all");
+  const [filterDay, setFilterDay] = useState<string>("");
   const [collapsedClients, setCollapsedClients] = useState<Set<string>>(new Set());
   const [collapsedNames, setCollapsedNames] = useState<Set<string>>(new Set());
 
@@ -336,9 +337,18 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
       if (filterStatus !== "all") {
         if (!Object.values(row.statuses).some(s => s === filterStatus)) return false;
       }
+      if (filterDay) {
+        const day = filterDay.padStart(2, "0");
+        const allDates = [
+          row.dateFrom,
+          row.dateTo,
+          ...Object.values(row.equipment),
+        ];
+        if (!allDates.some(d => d && d.startsWith(day + "."))) return false;
+      }
       return true;
     });
-  }, [data.rows, search, filterStatus]);
+  }, [data.rows, search, filterStatus, filterDay]);
 
   const groups = useMemo(() => groupByClient(filteredRows), [filteredRows]);
 
@@ -391,7 +401,7 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
     return result;
   }, [visibleCols]);
 
-  const activeFilters = [search !== "", filterStatus !== "all", filterCat !== "all"].filter(Boolean).length;
+  const activeFilters = [search !== "", filterStatus !== "all", filterCat !== "all", filterDay !== ""].filter(Boolean).length;
 
   return (
     <div className="animate-slide-up">
@@ -441,8 +451,27 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
             ))}
           </select>
         </div>
+        <div className="min-w-[130px]">
+          <label className="text-xs text-muted-foreground mb-1.5 block">День месяца</label>
+          <div className="relative">
+            <Icon name="CalendarDays" size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="number" min={1} max={31}
+              value={filterDay}
+              onChange={e => setFilterDay(e.target.value)}
+              placeholder="напр. 17"
+              className="w-full bg-background border border-border rounded pl-8 pr-3 py-1.5 text-sm placeholder:text-muted-foreground focus:outline-none focus:border-primary transition-colors [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+            />
+            {filterDay && (
+              <button onClick={() => setFilterDay("")}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                <Icon name="X" size={11} />
+              </button>
+            )}
+          </div>
+        </div>
         {activeFilters > 0 && (
-          <button onClick={() => { setSearch(""); setFilterStatus("all"); setFilterCat("all"); }}
+          <button onClick={() => { setSearch(""); setFilterStatus("all"); setFilterCat("all"); setFilterDay(""); }}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground border border-border rounded transition-colors bg-background">
             <Icon name="X" size={12} /> Сбросить ({activeFilters})
           </button>

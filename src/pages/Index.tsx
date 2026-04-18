@@ -8,10 +8,16 @@ type CellStatus = "planned" | "in-progress" | "completed" | "delayed" | "empty";
 
 interface ExcelRow {
   id: string;
-  cipher: string;
+  cipher: string;   // заказчик (может быть пустым — тогда берём из предыдущей строки)
   name: string;
-  equipment: Record<string, string>; // equipmentName -> plannedDate
-  statuses: Record<string, CellStatus>; // equipmentName -> status
+  equipment: Record<string, string>;
+  statuses: Record<string, CellStatus>;
+}
+
+interface GroupedClient {
+  client: string;
+  rows: ExcelRow[];
+  collapsed: boolean;
 }
 
 interface ExcelData {
@@ -22,11 +28,11 @@ interface ExcelData {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const STATUS_CONFIG: Record<CellStatus, { label: string; cls: string; bg: string; dot: string }> = {
-  planned:      { label: "По плану",    cls: "text-blue-400",   bg: "bg-blue-400/10",   dot: "bg-blue-400" },
-  "in-progress":{ label: "В работе",    cls: "text-yellow-400", bg: "bg-yellow-400/10", dot: "bg-yellow-400" },
-  completed:    { label: "Выполнено",   cls: "text-green-400",  bg: "bg-green-400/10",  dot: "bg-green-400" },
-  delayed:      { label: "Просрочено",  cls: "text-red-400",    bg: "bg-red-400/10",    dot: "bg-red-400" },
-  empty:        { label: "—",           cls: "text-muted-foreground", bg: "", dot: "bg-muted" },
+  planned:       { label: "По плану",   cls: "text-blue-400",   bg: "bg-blue-400/10",   dot: "bg-blue-400" },
+  "in-progress": { label: "В работе",   cls: "text-yellow-400", bg: "bg-yellow-400/10", dot: "bg-yellow-400" },
+  completed:     { label: "Выполнено",  cls: "text-green-400",  bg: "bg-green-400/10",  dot: "bg-green-400" },
+  delayed:       { label: "Просрочено", cls: "text-red-400",    bg: "bg-red-400/10",    dot: "bg-red-400" },
+  empty:         { label: "—",          cls: "text-muted-foreground", bg: "", dot: "bg-muted" },
 };
 
 function parseExcel(file: File): Promise<ExcelData> {
@@ -41,16 +47,25 @@ function parseExcel(file: File): Promise<ExcelData> {
 
         if (raw.length < 2) { reject(new Error("Файл пустой или не содержит данных")); return; }
 
-        // First row: headers. Col 0 = Шифр, Col 1 = Наименование, Col 2+ = оборудование
         const headers = (raw[0] as unknown[]).map(h => String(h ?? "").trim());
         const equipmentColumns = headers.slice(2).filter(h => h !== "");
 
         const rows: ExcelRow[] = [];
+        let lastCipher = "";
+
         for (let i = 1; i < raw.length; i++) {
           const row = raw[i] as unknown[];
-          const cipher = String(row[0] ?? "").trim();
+          const rawCipher = String(row[0] ?? "").trim();
           const name = String(row[1] ?? "").trim();
-          if (!cipher && !name) continue;
+
+          // Если в колонке заказчика есть значение — запоминаем его
+          if (rawCipher) lastCipher = rawCipher;
+
+          // Пропускаем полностью пустые строки
+          if (!rawCipher && !name) continue;
+
+          // Строка-заголовок группы (только заказчик, нет наименования) — не добавляем как позицию
+          if (rawCipher && !name) continue;
 
           const equipment: Record<string, string> = {};
           equipmentColumns.forEach((col, idx) => {
@@ -59,10 +74,9 @@ function parseExcel(file: File): Promise<ExcelData> {
               equipment[col] = cell.toLocaleDateString("ru-RU");
             } else if (cell !== "" && cell !== null && cell !== undefined) {
               const str = String(cell).trim();
-              // Try to parse Excel serial date number
               if (/^\d{5}$/.test(str)) {
                 const d = XLSX.SSF.parse_date_code(Number(str));
-                if (d) equipment[col] = `${String(d.d).padStart(2,"0")}.${String(d.m).padStart(2,"0")}.${d.y}`;
+                if (d) equipment[col] = `${String(d.d).padStart(2, "0")}.${String(d.m).padStart(2, "0")}.${d.y}`;
                 else equipment[col] = str;
               } else {
                 equipment[col] = str;
@@ -77,7 +91,7 @@ function parseExcel(file: File): Promise<ExcelData> {
 
           rows.push({
             id: `row-${i}`,
-            cipher,
+            cipher: lastCipher,
             name,
             equipment,
             statuses,
@@ -94,20 +108,20 @@ function parseExcel(file: File): Promise<ExcelData> {
   });
 }
 
-function formatDate(val: string) {
-  if (!val) return "—";
-  return val;
+// Группировка строк по заказчику
+function groupByClient(rows: ExcelRow[]): GroupedClient[] {
+  const map = new Map<string, ExcelRow[]>();
+  for (const row of rows) {
+    const key = row.cipher || "—";
+    if (!map.has(key)) map.set(key, []);
+    map.get(key)!.push(row);
+  }
+  return Array.from(map.entries()).map(([client, rows]) => ({ client, rows, collapsed: false }));
 }
 
-// ─── Status Selector ─────────────────────────────────────────────────────────
+// ─── Status Dropdown ─────────────────────────────────────────────────────────
 
-function StatusDropdown({
-  value,
-  onChange,
-}: {
-  value: CellStatus;
-  onChange: (s: CellStatus) => void;
-}) {
+function StatusDropdown({ value, onChange }: { value: CellStatus; onChange: (s: CellStatus) => void }) {
   const [open, setOpen] = useState(false);
   const cfg = STATUS_CONFIG[value];
 
@@ -128,11 +142,8 @@ function StatusDropdown({
           {(Object.entries(STATUS_CONFIG) as [CellStatus, typeof STATUS_CONFIG[CellStatus]][])
             .filter(([k]) => k !== "empty")
             .map(([k, v]) => (
-              <button
-                key={k}
-                onClick={() => { onChange(k); setOpen(false); }}
-                className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-secondary/50 transition-colors ${value === k ? v.cls : "text-muted-foreground"}`}
-              >
+              <button key={k} onClick={() => { onChange(k); setOpen(false); }}
+                className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-secondary/50 transition-colors ${value === k ? v.cls : "text-muted-foreground"}`}>
                 <span className={`w-1.5 h-1.5 rounded-full ${v.dot}`} />
                 {v.label}
               </button>
@@ -152,9 +163,7 @@ function UploadZone({ onLoad }: { onLoad: (data: ExcelData, name: string) => voi
   const [error, setError] = useState<string | null>(null);
 
   const handleFile = useCallback(async (file: File) => {
-    if (!file.name.match(/\.xlsx?$/i)) {
-      setError("Поддерживаются только файлы .xlsx"); return;
-    }
+    if (!file.name.match(/\.xlsx?$/i)) { setError("Поддерживаются только файлы .xlsx"); return; }
     setLoading(true); setError(null);
     try {
       const data = await parseExcel(file);
@@ -189,7 +198,6 @@ function UploadZone({ onLoad }: { onLoad: (data: ExcelData, name: string) => voi
         >
           <input ref={inputRef} type="file" accept=".xlsx,.xls" className="hidden"
             onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }} />
-
           {loading ? (
             <div className="flex flex-col items-center gap-3">
               <div className="w-10 h-10 border-2 border-primary border-t-transparent rounded-full animate-spin" />
@@ -202,24 +210,18 @@ function UploadZone({ onLoad }: { onLoad: (data: ExcelData, name: string) => voi
                 <Icon name="FileSpreadsheet" size={32} />
               </div>
               <div>
-                <div className="font-semibold text-base mb-1">
-                  {dragging ? "Отпустите файл" : "Загрузите Excel-файл"}
-                </div>
-                <div className="text-sm text-muted-foreground">
-                  Перетащите .xlsx или нажмите для выбора
-                </div>
+                <div className="font-semibold text-base mb-1">{dragging ? "Отпустите файл" : "Загрузите Excel-файл"}</div>
+                <div className="text-sm text-muted-foreground">Перетащите .xlsx или нажмите для выбора</div>
               </div>
               <div className="bg-secondary/60 rounded-lg px-4 py-2.5 text-xs text-muted-foreground text-left space-y-1">
                 <div className="font-medium text-foreground mb-1.5">Ожидаемая структура файла:</div>
-                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">A1</span> Шифр изделия</div>
-                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">B1</span> Наименование</div>
-                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">C1+</span> Названия оборудования</div>
-                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">C2+</span> Плановые даты</div>
+                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">A</span> Заказчик (группировка)</div>
+                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">B</span> Наименование изделия</div>
+                <div className="flex items-center gap-2"><span className="font-mono-data bg-background px-1.5 py-0.5 rounded text-primary">C+</span> Оборудование → плановые даты</div>
               </div>
             </div>
           )}
         </div>
-
         {error && (
           <div className="mt-3 flex items-center gap-2 px-4 py-3 bg-red-400/10 border border-red-400/20 rounded-lg text-sm text-red-400">
             <Icon name="AlertCircle" size={15} />
@@ -231,22 +233,23 @@ function UploadZone({ onLoad }: { onLoad: (data: ExcelData, name: string) => voi
   );
 }
 
-// ─── Main Table ───────────────────────────────────────────────────────────────
+// ─── Production Table ─────────────────────────────────────────────────────────
 
 function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows: ExcelRow[]) => void }) {
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState<CellStatus | "all">("all");
   const [filterEquip, setFilterEquip] = useState<string>("all");
+  const [collapsedClients, setCollapsedClients] = useState<Set<string>>(new Set());
 
-  const filtered = useMemo(() => {
+  // Фильтрация
+  const filteredRows = useMemo(() => {
     return data.rows.filter(row => {
       if (search) {
         const q = search.toLowerCase();
         if (!row.cipher.toLowerCase().includes(q) && !row.name.toLowerCase().includes(q)) return false;
       }
       if (filterStatus !== "all") {
-        const hasStatus = Object.values(row.statuses).some(s => s === filterStatus);
-        if (!hasStatus) return false;
+        if (!Object.values(row.statuses).some(s => s === filterStatus)) return false;
       }
       if (filterEquip !== "all") {
         if (!row.equipment[filterEquip]) return false;
@@ -254,6 +257,9 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
       return true;
     });
   }, [data.rows, search, filterStatus, filterEquip]);
+
+  // Группировка отфильтрованных строк
+  const groups = useMemo(() => groupByClient(filteredRows), [filteredRows]);
 
   const stats = useMemo(() => {
     const all = data.rows.flatMap(r => Object.values(r.statuses));
@@ -269,23 +275,38 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
     onUpdate(updated);
   }
 
+  function toggleClient(client: string) {
+    setCollapsedClients(prev => {
+      const next = new Set(prev);
+      if (next.has(client)) next.delete(client); else next.add(client);
+      return next;
+    });
+  }
+
+  function toggleAll(collapse: boolean) {
+    if (collapse) setCollapsedClients(new Set(groups.map(g => g.client)));
+    else setCollapsedClients(new Set());
+  }
+
   const activeFilters = [search !== "", filterStatus !== "all", filterEquip !== "all"].filter(Boolean).length;
+  const totalCols = 2 + data.equipmentColumns.length;
 
   return (
     <div className="animate-slide-up">
-      {/* Stats row */}
+      {/* Stats */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
         {([
-          { key: "planned",      icon: "Calendar",      label: "По плану" },
-          { key: "in-progress",  icon: "Zap",           label: "В работе" },
-          { key: "completed",    icon: "CheckCircle2",   label: "Выполнено" },
-          { key: "delayed",      icon: "AlertTriangle",  label: "Просрочено" },
+          { key: "planned",      icon: "Calendar",     label: "По плану" },
+          { key: "in-progress",  icon: "Zap",          label: "В работе" },
+          { key: "completed",    icon: "CheckCircle2",  label: "Выполнено" },
+          { key: "delayed",      icon: "AlertTriangle", label: "Просрочено" },
         ] as { key: CellStatus; icon: string; label: string }[]).map(({ key, icon, label }) => {
           const cfg = STATUS_CONFIG[key];
           return (
-            <div key={key} className={`rounded-lg border p-3 flex items-center gap-3 cursor-pointer transition-all
-              ${filterStatus === key ? "border-primary/40 bg-primary/5" : "border-border bg-card hover:border-border/60"}`}
-              onClick={() => setFilterStatus(f => f === key ? "all" : key)}>
+            <div key={key}
+              onClick={() => setFilterStatus(f => f === key ? "all" : key)}
+              className={`rounded-lg border p-3 flex items-center gap-3 cursor-pointer transition-all
+                ${filterStatus === key ? "border-primary/40 bg-primary/5" : "border-border bg-card hover:border-border/60"}`}>
               <div className={`w-8 h-8 rounded-md flex items-center justify-center flex-shrink-0 ${cfg.bg} ${cfg.cls}`}>
                 <Icon name={icon} size={16} />
               </div>
@@ -305,7 +326,7 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
           <div className="relative">
             <Icon name="Search" size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
             <input value={search} onChange={e => setSearch(e.target.value)}
-              placeholder="Шифр или наименование..."
+              placeholder="Заказчик или наименование..."
               className="w-full bg-background border border-border rounded pl-8 pr-3 py-1.5 text-sm placeholder:text-muted-foreground focus:outline-none focus:border-primary transition-colors" />
           </div>
         </div>
@@ -323,8 +344,15 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
             <Icon name="X" size={12} /> Сбросить ({activeFilters})
           </button>
         )}
-        <div className="ml-auto text-xs text-muted-foreground self-end pb-1.5">
-          Показано: <span className="font-mono-data text-foreground font-medium">{filtered.length}</span> / {data.rows.length}
+        <div className="flex items-center gap-1 ml-auto">
+          <button onClick={() => toggleAll(false)}
+            className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-muted-foreground hover:text-foreground border border-border rounded transition-colors bg-background">
+            <Icon name="ChevronsDown" size={12} /> Раскрыть все
+          </button>
+          <button onClick={() => toggleAll(true)}
+            className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-muted-foreground hover:text-foreground border border-border rounded transition-colors bg-background">
+            <Icon name="ChevronsUp" size={12} /> Свернуть все
+          </button>
         </div>
       </div>
 
@@ -334,10 +362,7 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
           <table className="w-full text-sm border-collapse">
             <thead>
               <tr className="border-b border-border bg-secondary/30">
-                <th className="text-left px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap sticky left-0 bg-card z-10 border-r border-border min-w-[110px]">
-                  Заказчик
-                </th>
-                <th className="text-left px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap sticky left-[110px] bg-card z-10 border-r border-border min-w-[220px]">
+                <th className="text-left px-4 py-3 text-xs font-medium text-muted-foreground uppercase tracking-wider whitespace-nowrap sticky left-0 bg-[hsl(220_14%_11%)] z-10 border-r border-border min-w-[200px]">
                   Наименование
                 </th>
                 {data.equipmentColumns.map(col => (
@@ -348,48 +373,94 @@ function ProductionTable({ data, onUpdate }: { data: ExcelData; onUpdate: (rows:
               </tr>
             </thead>
             <tbody>
-              {filtered.length === 0 ? (
+              {groups.length === 0 ? (
                 <tr>
-                  <td colSpan={2 + data.equipmentColumns.length} className="text-center py-14 text-muted-foreground">
+                  <td colSpan={totalCols} className="text-center py-14 text-muted-foreground">
                     <Icon name="SearchX" size={28} className="mx-auto mb-2 opacity-30" />
                     <div className="text-sm">Ничего не найдено</div>
                   </td>
                 </tr>
-              ) : filtered.map((row, i) => (
-                <tr key={row.id}
-                  className={`border-b border-border/50 hover:bg-secondary/20 transition-colors ${i % 2 === 0 ? "" : "bg-secondary/5"}`}>
-                  <td className="px-4 py-2.5 font-mono-data text-xs text-primary font-medium sticky left-0 bg-card border-r border-border whitespace-nowrap z-[1]"
-                    style={{ background: i % 2 === 0 ? "hsl(var(--card))" : "hsl(220 14% 12%)" }}>
-                    {row.cipher || "—"}
-                  </td>
-                  <td className="px-4 py-2.5 font-medium sticky left-[110px] bg-card border-r border-border whitespace-nowrap z-[1]"
-                    style={{ background: i % 2 === 0 ? "hsl(var(--card))" : "hsl(220 14% 12%)" }}>
-                    {row.name || "—"}
-                  </td>
-                  {data.equipmentColumns.map(col => {
-                    const date = row.equipment[col];
-                    const status = row.statuses[col];
-                    const cfg = STATUS_CONFIG[status];
-                    return (
-                      <td key={col} className="px-3 py-2">
-                        {date ? (
-                          <div className="space-y-1">
-                            <div className={`font-mono-data text-xs ${cfg.cls}`}>{formatDate(date)}</div>
-                            <StatusDropdown
-                              value={status}
-                              onChange={s => updateStatus(row.id, col, s)}
-                            />
-                          </div>
-                        ) : (
-                          <span className="text-muted-foreground/30 text-xs">—</span>
-                        )}
+              ) : groups.map((group) => {
+                const isCollapsed = collapsedClients.has(group.client);
+                const groupCompleted = group.rows.flatMap(r => Object.values(r.statuses)).filter(s => s === "completed").length;
+                const groupTotal = group.rows.flatMap(r => Object.values(r.statuses)).filter(s => s !== "empty").length;
+                const groupPct = groupTotal > 0 ? Math.round((groupCompleted / groupTotal) * 100) : 0;
+
+                return (
+                  <>
+                    {/* Group header row */}
+                    <tr key={`group-${group.client}`}
+                      className="border-b border-border bg-secondary/40 hover:bg-secondary/60 cursor-pointer transition-colors"
+                      onClick={() => toggleClient(group.client)}>
+                      <td className="px-4 py-2.5 sticky left-0 bg-secondary/40 border-r border-border z-[1]">
+                        <div className="flex items-center gap-2">
+                          <Icon name={isCollapsed ? "ChevronRight" : "ChevronDown"} size={14} className="text-muted-foreground flex-shrink-0" />
+                          <Icon name="Building2" size={13} className="text-primary flex-shrink-0" />
+                          <span className="font-semibold text-sm text-foreground">{group.client}</span>
+                          <span className="ml-1 text-xs text-muted-foreground font-mono-data">({group.rows.length} поз.)</span>
+                          {groupTotal > 0 && (
+                            <div className="ml-auto flex items-center gap-2 pl-2">
+                              <div className="w-20 h-1 bg-border rounded-full overflow-hidden">
+                                <div className="h-full bg-green-400/70 rounded-full" style={{ width: `${groupPct}%` }} />
+                              </div>
+                              <span className="text-xs font-mono-data text-muted-foreground">{groupPct}%</span>
+                            </div>
+                          )}
+                        </div>
                       </td>
-                    );
-                  })}
-                </tr>
-              ))}
+                      {data.equipmentColumns.map(col => (
+                        <td key={col} className="px-3 py-2.5" />
+                      ))}
+                    </tr>
+
+                    {/* Group rows */}
+                    {!isCollapsed && group.rows.map((row, i) => (
+                      <tr key={row.id}
+                        className={`border-b border-border/40 hover:bg-secondary/20 transition-colors ${i % 2 === 0 ? "bg-background/30" : ""}`}>
+                        <td className="px-4 py-2.5 sticky left-0 border-r border-border z-[1]"
+                          style={{ background: i % 2 === 0 ? "hsl(220 16% 9%)" : "hsl(220 14% 11%)" }}>
+                          <div className="flex items-center gap-2 pl-5">
+                            <span className="w-1 h-1 rounded-full bg-border flex-shrink-0" />
+                            <span className="font-medium text-sm">{row.name}</span>
+                          </div>
+                        </td>
+                        {data.equipmentColumns.map(col => {
+                          const date = row.equipment[col];
+                          const status = row.statuses[col];
+                          return (
+                            <td key={col} className="px-3 py-2">
+                              {date ? (
+                                <div className="space-y-1">
+                                  <div className={`font-mono-data text-xs ${STATUS_CONFIG[status].cls}`}>{date}</div>
+                                  <StatusDropdown value={status} onChange={s => updateStatus(row.id, col, s)} />
+                                </div>
+                              ) : (
+                                <span className="text-muted-foreground/25 text-xs">—</span>
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </>
+                );
+              })}
             </tbody>
           </table>
+        </div>
+
+        {/* Footer */}
+        <div className="px-4 py-2.5 border-t border-border flex items-center justify-between text-xs text-muted-foreground">
+          <span>
+            Заказчиков: <span className="font-mono-data text-foreground">{groups.length}</span>
+            &nbsp;·&nbsp;
+            Позиций: <span className="font-mono-data text-foreground">{filteredRows.length}</span>
+            {filteredRows.length !== data.rows.length && <span> из {data.rows.length}</span>}
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+            Данные загружены
+          </span>
         </div>
       </div>
     </div>
@@ -409,14 +480,11 @@ export default function Index() {
   }
 
   function handleReplace(file: File) {
-    parseExcel(file).then(data => {
-      handleLoad(data, file.name);
-    }).catch(() => {});
+    parseExcel(file).then(data => handleLoad(data, file.name)).catch(() => {});
   }
 
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
       <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-20">
         <div className="max-w-screen-2xl mx-auto px-4 sm:px-6">
           <div className="flex items-center justify-between h-14">
@@ -434,20 +502,16 @@ export default function Index() {
                 {fileName && (
                   <div className="hidden sm:flex items-center gap-1.5 text-xs text-muted-foreground bg-secondary/50 px-2.5 py-1.5 rounded border border-border">
                     <Icon name="FileSpreadsheet" size={12} className="text-green-400" />
-                    <span className="max-w-[180px] truncate">{fileName}</span>
+                    <span className="max-w-[200px] truncate">{fileName}</span>
                   </div>
                 )}
-                <button
-                  onClick={() => inputRef.current?.click()}
+                <button onClick={() => inputRef.current?.click()}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-xs border border-border rounded text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors bg-background">
-                  <Icon name="RefreshCw" size={12} />
-                  Заменить файл
+                  <Icon name="RefreshCw" size={12} /> Заменить файл
                 </button>
-                <button
-                  onClick={() => { setExcelData(null); setFileName(""); }}
+                <button onClick={() => { setExcelData(null); setFileName(""); }}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-xs border border-border rounded text-muted-foreground hover:text-red-400 hover:border-red-400/30 transition-colors bg-background">
-                  <Icon name="X" size={12} />
-                  Очистить
+                  <Icon name="X" size={12} /> Очистить
                 </button>
                 <input ref={inputRef} type="file" accept=".xlsx,.xls" className="hidden"
                   onChange={e => { const f = e.target.files?.[0]; if (f) handleReplace(f); e.target.value = ""; }} />
@@ -458,14 +522,10 @@ export default function Index() {
       </header>
 
       <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 py-5">
-        {!excelData ? (
-          <UploadZone onLoad={(data, name) => handleLoad(data, name)} />
-        ) : (
-          <ProductionTable
-            data={excelData}
-            onUpdate={(rows) => setExcelData(prev => prev ? { ...prev, rows } : prev)}
-          />
-        )}
+        {!excelData
+          ? <UploadZone onLoad={(data, name) => handleLoad(data, name)} />
+          : <ProductionTable data={excelData} onUpdate={rows => setExcelData(prev => prev ? { ...prev, rows } : prev)} />
+        }
       </div>
     </div>
   );
